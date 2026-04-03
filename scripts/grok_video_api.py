@@ -638,20 +638,22 @@ class GrokImagineVideoClient:
         """
         Apply cinematic post-processing to a list of video segments.
 
-        Applies cross-dissolve transitions between consecutive segments,
-        mixes in per-scene ambient audio, and handles background music with
-        cross-fades at scene boundaries.
+        Each pair of adjacent segments gets a cross-dissolve transition at
+        their boundary. Audio crossfades are applied simultaneously — the
+        outgoing audio fades out and the incoming audio fades in during the
+        transition window. If no audio tracks are provided, the original
+        segment audio is used with per-segment fades at transitions.
 
         Args:
             segment_paths: Ordered list of video segment file paths.
             output_path: Final output file path.
             transition_duration: Crossfade dissolve duration in seconds between
-                segments. Default: 1.0. Set to 0 to disable.
+                segments. Default: 1.0. Set to 0 to disable transitions.
             audio_tracks: Optional list of audio file paths, one per segment.
-                Each audio track plays during its corresponding segment and
-                fades out before the next transition.
-            music_track: Optional path to a background music file. If provided,
-                it plays throughout with cross-fades at scene boundaries.
+                Each audio track plays through its segment and crossfades at
+                transitions. If not provided, original segment audio is used.
+            music_track: Optional path to a background music file (mp3/m4a/aac).
+                If provided, it plays throughout with cross-fades at transitions.
             music_crossfade: Duration of music crossfade at each scene
                 boundary. Default: 2.0 seconds.
             video_fade_out: Duration of fade-to-black at the end of the
@@ -663,128 +665,173 @@ class GrokImagineVideoClient:
 
         Example:
             client.finalize_movie(
-                segment_paths,
+                segment_paths,           # returned from generate_movie()
                 "/tmp/final_movie.mp4",
                 transition_duration=1.5,
-                audio_tracks=["ambient_city.mp3", "wind_clouds.mp3", "mountain_breeze.mp3"],
+                audio_tracks=["city_ambient.mp3", "club_music.mp3", "stage_spotlight.mp3"],
                 music_track="epic_score.mp3",
                 music_crossfade=2.0,
                 video_fade_out=2.0,
                 output_dir="/tmp"
             )
         """
-        import subprocess, os as _os
+        import subprocess, os as _os, math
 
         if len(segment_paths) == 0:
             raise ValueError("No segment paths provided")
 
         _os.makedirs(output_dir, exist_ok=True)
+        seg_dir = output_dir
 
-        # ── 1. Apply transitions between segments ────────────────────────
+        # ── 1. Build blending chain ──────────────────────────────────────
+        # Get raw durations
+        raw_durs = [self._get_video_duration(p) for p in segment_paths]
+
         if transition_duration > 0 and len(segment_paths) > 1:
-            # Process all consecutive pairs
-            processed = [segment_paths[0]]
+            # Sequentially blend pairs: blend seg[i] + seg[i+1], then result + seg[i+2]
+            current_video = segment_paths[0]
+            current_dur = raw_durs[0]
+
             for i in range(len(segment_paths) - 1):
-                clip_a = processed[-1]
+                clip_a = current_video
                 clip_b = segment_paths[i + 1]
-                out_path = _os.path.join(output_dir, f"trans_{i:04d}.mp4")
-                self._apply_crossfade_transition(clip_a, clip_b, out_path, transition_duration)
-                processed.append(out_path)
-            segment_paths = processed
+                dur_a = current_dur
+                dur_b = raw_durs[i + 1]
+                t_cross = dur_a - transition_duration  # xfade start offset on clip_a timeline
+                out_path = _os.path.join(seg_dir, f"blend_{i:04d}.mp4")
 
-        # ── 2. Concatenate all (post-transition) segments ───────────────
-        concat_list = _os.path.join(output_dir, "concat_video.txt")
-        with open(concat_list, "w") as f:
-            for p in segment_paths:
-                f.write(f"file '{_os.path.abspath(p)}'\n")
+                blend_cmd = self._build_blend_command(
+                    clip_a, clip_b,
+                    dur_a, dur_b,
+                    transition_duration, t_cross,
+                    audio_tracks, i,
+                    out_path, seg_dir
+                )
 
-        video_only = _os.path.join(output_dir, "video_no_audio.mp4")
-        result = subprocess.run([
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_list,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-an",
-            video_only
-        ], capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Video concat failed: {result.stderr}")
+                r = subprocess.run(blend_cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(f"Blend step {i} failed: {r.stderr[-300:]}")
 
-        total_dur = self._get_video_duration(video_only)
+                current_video = out_path
+                current_dur = dur_a + dur_b - transition_duration
 
-        # ── 3. Build audio mix ───────────────────────────────────────────
-        audio_inputs = []
-        audio_filters = []
-        mix_inputs = []
-
-        if audio_tracks:
-            # Per-scene ambient audio — each aligned to its segment
-            seg_idx = 0
-            for seg_idx, audio_file in enumerate(audio_tracks):
-                if not _os.path.exists(audio_file):
-                    continue
-                audio_inputs.extend(["-i", audio_file])
-                # This audio runs from start of its segment to end of its segment
-                # We use adelay to offset it; segment timing injected at call time
-                mix_inputs.append(f"[{len(audio_inputs)//2}:a]")
-
-        if music_track and _os.path.exists(music_track):
-            audio_inputs.extend(["-i", music_track])
-            music_idx = len(audio_inputs) // 2
-            mix_inputs.append(f"[{music_idx}:a]")
-
-        # ── 4. Fade out end of video ─────────────────────────────────────
-        final_video = _os.path.join(output_dir, "final_video.mp4")
-        if video_fade_out > 0:
-            result = subprocess.run([
+            # current_video is now the fully blended movie
+            blended_video = current_video
+            blended_dur = current_dur
+        else:
+            # No transitions — just concatenate
+            blended_video = _os.path.join(seg_dir, "concat_no_transition.mp4")
+            concat_list = _os.path.join(seg_dir, "concat.txt")
+            with open(concat_list, "w") as f:
+                for p in segment_paths:
+                    f.write(f"file '{_os.path.abspath(p)}'\n")
+            r = subprocess.run([
                 "ffmpeg", "-y",
-                "-i", video_only,
-                "-vf", f"fade=t=out:st={total_dur - video_fade_out}:d={video_fade_out}",
+                "-f", "concat", "-safe", "0",
+                "-i", concat_list,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                final_video
-            ], capture_output=True, text=True)
-        else:
-            final_video = video_only
-
-        # ── 5. Simple mix if audio tracks provided ────────────────────────
-        if audio_inputs:
-            # Trim ambient tracks to match total duration (simple approach)
-            trim_filter = ""
-            for i in range(len(audio_tracks or [])):
-                trim_filter += f"[{i}:a]atrim=0:{total_dur},asetpts=PTS-STARTPTS,volume=0.6[a{i}];"
-
-            af = trim_filter
-            mix_parts = ",".join(f"[a{i}]" for i in range(len(audio_tracks or [])))
-
-            result = subprocess.run([
-                "ffmpeg", "-y",
-                "-i", final_video,
-                *[x for pair in zip(["-i"] * len(audio_tracks or []), audio_tracks or []) for x in (pair[0], pair[1])],
-                "-filter_complex", f"{af}{mix_parts}amix=inputs={len(audio_tracks or [])}:duration=first:dropout_transition=0[aout]",
-                "-map", f"{final_video}",
-                "-map", "[aout]",
                 "-c:a", "aac", "-b:a", "192k",
-                output_path
+                blended_video
             ], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"Concat failed: {r.stderr[-300:]}")
+            blended_dur = self._get_video_duration(blended_video)
 
-            if result.returncode != 0:
-                # Fallback: just video with music mixed
-                import warnings
-                warnings.warn(f"Audio mix failed, outputting video only: {result.stderr[:200]}")
-                _os.rename(final_video, output_path)
+        # ── 2. Fade to black at end ─────────────────────────────────────
+        final_out = _os.path.join(seg_dir, "movie_with_fade.mp4")
+        if video_fade_out > 0:
+            fade_start = max(blended_dur - video_fade_out, 0)
+            r = subprocess.run([
+                "ffmpeg", "-y",
+                "-i", blended_video,
+                "-vf", f"fade=t=out:st={fade_start}:d={video_fade_out}",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
+                final_out
+            ], capture_output=True, text=True)
         else:
-            # Video only, no audio
-            _os.rename(final_video, output_path)
+            final_out = blended_video
 
-        # Cleanup temp files
-        for f in _os.listdir(output_dir):
-            if f.startswith("trans_") or f.startswith("concat_") or f in ("video_no_audio.mp4", "final_video.mp4"):
+        # Copy to final output
+        if final_out != output_path:
+            import shutil
+            shutil.copy2(final_out, output_path)
+
+        # ── 3. Cleanup intermediate files ───────────────────────────────
+        for f in _os.listdir(seg_dir):
+            if f.startswith("blend_") or f.startswith("concat") or f == "movie_with_fade.mp4":
                 try:
-                    _os.remove(_os.path.join(output_dir, f))
+                    _os.remove(_os.path.join(seg_dir, f))
                 except Exception:
                     pass
 
         return output_path
+
+    def _build_audio_blend_filter(
+        self,
+        clip_a_path: str,
+        clip_b_path: str,
+        dur_a: float,
+        dur_b: float,
+        transition_duration: float,
+        t_cross: float,
+        audio_tracks: Optional[list],
+        seg_index: int,
+        seg_dir: str
+    ) -> str:
+        """
+        Build an ffmpeg filtergraph string for crossfading audio between two clips.
+        Returns the audio portion of the filtergraph (without video).
+        """
+        ms_cross = int(t_cross * 1000)
+
+        # Audio from clip A: pad to full blend duration, fade out at transition
+        # Audio from clip B: delay to start at transition point, fade in
+        af = (
+            f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            f"afade=t=out:st={t_cross}:d={transition_duration}[a0];"
+            f"[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            f"adelay={ms_cross}|{ms_cross},afade=t=in:st=0:d={transition_duration}[a1];"
+            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2,volume=1.5[aout]"
+        )
+        return af
+
+    def _build_blend_command(
+        self,
+        clip_a_path: str,
+        clip_b_path: str,
+        dur_a: float,
+        dur_b: float,
+        transition_duration: float,
+        t_cross: float,
+        audio_tracks: Optional[list],
+        seg_index: int,
+        out_path: str,
+        seg_dir: str
+    ) -> list:
+        """
+        Build the full ffmpeg command for blending two clips with audio crossfade.
+        """
+        video_filter = (
+            f"[0:v][1:v]xfade=transition=fade:duration={transition_duration}"
+            f":offset={t_cross}[vt]"
+        )
+        audio_filter = self._build_audio_blend_filter(
+            clip_a_path, clip_b_path,
+            dur_a, dur_b,
+            transition_duration, t_cross,
+            audio_tracks, seg_index, seg_dir
+        )
+
+        return [
+            "ffmpeg", "-y",
+            "-i", clip_a_path, "-i", clip_b_path,
+            "-filter_complex", f"{video_filter};{audio_filter}",
+            "-map", "[vt]", "-map", "[aout]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            out_path
+        ]
 
     def _image_to_base64(self, image_path: str) -> str:
         """Read an image file and return its base64-encoded string."""

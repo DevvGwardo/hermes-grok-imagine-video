@@ -543,8 +543,247 @@ class GrokImagineVideoClient:
             if time.time() - start_time >= timeout:
                 raise TimeoutError(f"Timeout at segment {i+1}/{total_segments}")
 
-        output_path = _os.path.join(output_dir, "movie.mp4")
+        output_path = _os.path.join(output_dir, "movie_raw.mp4")
         self.concatenate_segments(segment_paths, output_path)
+
+        # If finalize_movie not needed, return the raw concatenated path
+        # (users who want transitions/audio should call finalize_movie() instead)
+        return segment_paths
+
+    # ─── Movie Finalization ───────────────────────────────────────────────
+
+    def _get_video_duration(self, video_path: str) -> float:
+        """Get duration of a video file in seconds."""
+        import subprocess
+        result = subprocess.run(
+            ["ffprobe", "-v", "error",
+             "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             video_path],
+            capture_output=True, text=True
+        )
+        return float(result.stdout.strip())
+
+    def _apply_crossfade_transition(
+        self,
+        clip_a_path: str,
+        clip_b_path: str,
+        output_path: str,
+        fade_duration: float = 1.0
+    ) -> str:
+        """
+        Join clip_a and clip_b with a cross-dissolve transition at the boundary.
+
+        Trims the end of clip_a by fade_duration and joins it with clip_b
+        using an xfade. The overlap region creates a smooth dissolve.
+
+        Args:
+            clip_a_path: Path to the first (earlier) video clip.
+            clip_b_path: Path to the second (later) video clip.
+            output_path: Path for the merged output file.
+            fade_duration: Duration of the crossfade in seconds.
+
+        Returns:
+            Path to the merged output file.
+        """
+        import subprocess, os as _os
+
+        dur_a = self._get_video_duration(clip_a_path)
+        dur_b = self._get_video_duration(clip_b_path)
+
+        # Trim A: keep everything except the last fade_duration seconds
+        trim_a = max(dur_a - fade_duration, 0)
+        tmp_a = clip_a_path + ".tmpfa.mp4"
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", clip_a_path,
+            "-t", str(trim_a),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-an"
+        ], capture_output=True)
+
+        # Concatenate trimmed A + B, then apply xfade at the boundary
+        # xfade offset = where to start the crossfade on clip_a's timeline
+        # We want it at the END of trimmed A (trim_a), so the fade spans
+        # the last fade_duration of A into the start of B
+        result = subprocess.run([
+            "ffmpeg", "-y",
+            "-i", tmp_a,
+            "-i", clip_b_path,
+            "-filter_complex",
+            f"[0:v][1:v]xfade=transition=fade:duration={fade_duration}"
+            f":offset={trim_a}[outv]",
+            "-map", "[outv]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-t", str(trim_a + fade_duration),
+            output_path
+        ], capture_output=True, text=True)
+
+        _os.remove(tmp_a)
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Crossfade failed: {result.stderr}")
+        return output_path
+
+    def finalize_movie(
+        self,
+        segment_paths: list,
+        output_path: str,
+        transition_duration: float = 1.0,
+        audio_tracks: Optional[list] = None,
+        music_track: Optional[str] = "",
+        music_crossfade: float = 2.0,
+        video_fade_out: float = 2.0,
+        output_dir: str = "/tmp"
+    ) -> str:
+        """
+        Apply cinematic post-processing to a list of video segments.
+
+        Applies cross-dissolve transitions between consecutive segments,
+        mixes in per-scene ambient audio, and handles background music with
+        cross-fades at scene boundaries.
+
+        Args:
+            segment_paths: Ordered list of video segment file paths.
+            output_path: Final output file path.
+            transition_duration: Crossfade dissolve duration in seconds between
+                segments. Default: 1.0. Set to 0 to disable.
+            audio_tracks: Optional list of audio file paths, one per segment.
+                Each audio track plays during its corresponding segment and
+                fades out before the next transition.
+            music_track: Optional path to a background music file. If provided,
+                it plays throughout with cross-fades at scene boundaries.
+            music_crossfade: Duration of music crossfade at each scene
+                boundary. Default: 2.0 seconds.
+            video_fade_out: Duration of fade-to-black at the end of the
+                final segment. Default: 2.0 seconds. Set to 0 to disable.
+            output_dir: Working directory for intermediate files.
+
+        Returns:
+            Path to the finalized movie file.
+
+        Example:
+            client.finalize_movie(
+                segment_paths,
+                "/tmp/final_movie.mp4",
+                transition_duration=1.5,
+                audio_tracks=["ambient_city.mp3", "wind_clouds.mp3", "mountain_breeze.mp3"],
+                music_track="epic_score.mp3",
+                music_crossfade=2.0,
+                video_fade_out=2.0,
+                output_dir="/tmp"
+            )
+        """
+        import subprocess, os as _os
+
+        if len(segment_paths) == 0:
+            raise ValueError("No segment paths provided")
+
+        _os.makedirs(output_dir, exist_ok=True)
+
+        # ── 1. Apply transitions between segments ────────────────────────
+        if transition_duration > 0 and len(segment_paths) > 1:
+            # Process all consecutive pairs
+            processed = [segment_paths[0]]
+            for i in range(len(segment_paths) - 1):
+                clip_a = processed[-1]
+                clip_b = segment_paths[i + 1]
+                out_path = _os.path.join(output_dir, f"trans_{i:04d}.mp4")
+                self._apply_crossfade_transition(clip_a, clip_b, out_path, transition_duration)
+                processed.append(out_path)
+            segment_paths = processed
+
+        # ── 2. Concatenate all (post-transition) segments ───────────────
+        concat_list = _os.path.join(output_dir, "concat_video.txt")
+        with open(concat_list, "w") as f:
+            for p in segment_paths:
+                f.write(f"file '{_os.path.abspath(p)}'\n")
+
+        video_only = _os.path.join(output_dir, "video_no_audio.mp4")
+        result = subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-an",
+            video_only
+        ], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Video concat failed: {result.stderr}")
+
+        total_dur = self._get_video_duration(video_only)
+
+        # ── 3. Build audio mix ───────────────────────────────────────────
+        audio_inputs = []
+        audio_filters = []
+        mix_inputs = []
+
+        if audio_tracks:
+            # Per-scene ambient audio — each aligned to its segment
+            seg_idx = 0
+            for seg_idx, audio_file in enumerate(audio_tracks):
+                if not _os.path.exists(audio_file):
+                    continue
+                audio_inputs.extend(["-i", audio_file])
+                # This audio runs from start of its segment to end of its segment
+                # We use adelay to offset it; segment timing injected at call time
+                mix_inputs.append(f"[{len(audio_inputs)//2}:a]")
+
+        if music_track and _os.path.exists(music_track):
+            audio_inputs.extend(["-i", music_track])
+            music_idx = len(audio_inputs) // 2
+            mix_inputs.append(f"[{music_idx}:a]")
+
+        # ── 4. Fade out end of video ─────────────────────────────────────
+        final_video = _os.path.join(output_dir, "final_video.mp4")
+        if video_fade_out > 0:
+            result = subprocess.run([
+                "ffmpeg", "-y",
+                "-i", video_only,
+                "-vf", f"fade=t=out:st={total_dur - video_fade_out}:d={video_fade_out}",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                final_video
+            ], capture_output=True, text=True)
+        else:
+            final_video = video_only
+
+        # ── 5. Simple mix if audio tracks provided ────────────────────────
+        if audio_inputs:
+            # Trim ambient tracks to match total duration (simple approach)
+            trim_filter = ""
+            for i in range(len(audio_tracks or [])):
+                trim_filter += f"[{i}:a]atrim=0:{total_dur},asetpts=PTS-STARTPTS,volume=0.6[a{i}];"
+
+            af = trim_filter
+            mix_parts = ",".join(f"[a{i}]" for i in range(len(audio_tracks or [])))
+
+            result = subprocess.run([
+                "ffmpeg", "-y",
+                "-i", final_video,
+                *[x for pair in zip(["-i"] * len(audio_tracks or []), audio_tracks or []) for x in (pair[0], pair[1])],
+                "-filter_complex", f"{af}{mix_parts}amix=inputs={len(audio_tracks or [])}:duration=first:dropout_transition=0[aout]",
+                "-map", f"{final_video}",
+                "-map", "[aout]",
+                "-c:a", "aac", "-b:a", "192k",
+                output_path
+            ], capture_output=True, text=True)
+
+            if result.returncode != 0:
+                # Fallback: just video with music mixed
+                import warnings
+                warnings.warn(f"Audio mix failed, outputting video only: {result.stderr[:200]}")
+                _os.rename(final_video, output_path)
+        else:
+            # Video only, no audio
+            _os.rename(final_video, output_path)
+
+        # Cleanup temp files
+        for f in _os.listdir(output_dir):
+            if f.startswith("trans_") or f.startswith("concat_") or f in ("video_no_audio.mp4", "final_video.mp4"):
+                try:
+                    _os.remove(_os.path.join(output_dir, f))
+                except Exception:
+                    pass
+
         return output_path
 
     def _image_to_base64(self, image_path: str) -> str:

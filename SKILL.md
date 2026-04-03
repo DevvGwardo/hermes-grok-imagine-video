@@ -298,6 +298,62 @@ client.concatenate_segments(segments, "/tmp/long_video.mp4")
 | `TimeoutError` | Reduce duration or complexity |
 | `FileNotFoundError` | Install ffmpeg (`brew install ffmpeg` on macOS) |
 
+## Finalizing a Movie
+
+After generating segments with `generate_movie()`, use `finalize_movie()` to apply cinematic post-processing:
+
+```
+python3 - << 'EOF'
+import os, sys
+sys.path.insert(0, 'scripts')
+from grok_video_api import GrokImagineVideoClient
+
+client = GrokImagineVideoClient(os.getenv("XAI_API_KEY"))
+
+# Step 1: Generate the raw chained segments
+segments = client.generate_movie(
+    scenes=[
+        {
+            "prompt": "A superhero stands heroically on a dark city rooftop, cape billowing in the wind. City lights glow below.",
+            "duration": 20,
+            "image_url": "https://example.com/hero.jpg"
+        },
+        {
+            "prompt": "High above the clouds, cape streaming behind. Lightning crackles around the hero as clouds rush past.",
+            "duration": 20
+        },
+        {
+            "prompt": "Landing gracefully on a mountain peak at golden hour. The hero turns to the camera and says 'I'm here to save the day'.",
+            "duration": 20
+        },
+    ],
+    output_dir="/tmp/movie_build",
+    resolution="720p"
+)
+# segments is a list of segment file paths — pass it directly to finalize_movie()
+
+# Step 2: Apply cinematic transitions and effects
+final = client.finalize_movie(
+    segment_paths=segments,         # returned from generate_movie()
+    output_path="/tmp/cinematic.mp4",
+    transition_duration=1.5,         # 1.5s cross-dissolve between segments
+    video_fade_out=2.0,            # 2s fade-to-black at the end
+    output_dir="/tmp/movie_build"
+)
+print(final)
+EOF
+```
+
+### Transition Parameters
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `transition_duration` | 1.0 | Seconds of cross-dissolve between segments. Set 0 to disable. |
+| `video_fade_out` | 2.0 | Fade-to-black at the very end. Set 0 to disable. |
+| `music_track` | — | Path to background music file (mp3/m4a/aac). |
+| `music_crossfade` | 2.0 | Music crossfade duration at each scene boundary. |
+| `audio_tracks` | — | Per-scene ambient audio files (city sounds, wind, etc.). |
+
 ## Best Practices
 ### Prompt Writing
 

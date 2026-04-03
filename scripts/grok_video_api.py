@@ -61,31 +61,149 @@ class GrokImagineVideoClient:
         response.raise_for_status()
         return response.json()
 
+    def _resolve_image_url(self, image_url: str) -> str:
+        """
+        Resolve an image URL for API calls.
+
+        - HTTPS URLs: passed through unchanged
+        - base64 data URLs: passed through unchanged
+        - Local file paths (starting with / or ~): converted to base64 data URL
+
+        The xAI API only accepts HTTPS URLs or base64 data URLs — file://
+        URLs and local paths must be converted before sending.
+        """
+        import base64, os
+
+        if image_url.startswith(("http://", "https://", "data:")):
+            return image_url
+
+        # Local file — convert to base64 data URL
+        path = os.path.expanduser(image_url)
+        if not os.path.isabs(path):
+            raise ValueError(f"Invalid image path: {image_url}")
+
+        with open(path, "rb") as f:
+            data = f.read()
+
+        # Detect MIME type from magic bytes
+        if data.startswith(b"\xff\xd8"):
+            mime = "image/jpeg"
+        elif data.startswith(b"\x89PNG"):
+            mime = "image/png"
+        elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            mime = "image/webp"
+        else:
+            mime = "application/octet-stream"
+
+        b64 = base64.b64encode(data).decode("utf-8")
+        return f"data:{mime};base64,{b64}"
+
+    def _resolve_video_url(self, video_url: str) -> str:
+        """
+        Resolve a video URL for API calls.
+
+        - HTTPS URLs: passed through unchanged
+        - base64 data URLs: passed through unchanged
+        - Local file paths: converted to base64 data URL
+
+        The xAI video API only accepts HTTPS URLs or base64 data URLs.
+        Local .mp4 files are auto-converted.
+        """
+        import base64, os
+
+        if video_url.startswith(("http://", "https://", "data:")):
+            return video_url
+
+        path = os.path.expanduser(video_url)
+        if not os.path.isabs(path):
+            raise ValueError(f"Invalid video path: {video_url}")
+
+        with open(path, "rb") as f:
+            data = f.read()
+
+        # Videos must be .mp4 with supported codecs
+        b64 = base64.b64encode(data).decode("utf-8")
+        return f"data:video/mp4;base64,{b64}"
+
     def image_to_video(
         self,
         image_url: str,
         prompt: str = "",
-        duration: int = 10
+        duration: int = 10,
+        reference_images: Optional[list] = None
     ) -> Dict[str, Any]:
         """
         Animate a static image into video.
 
         Args:
-            image_url: Public URL of the source image OR base64 data URI
-            prompt: Optional text prompt to guide animation
-            duration: Video duration in seconds (1-15)
+            image_url: Public HTTPS URL, base64 data URL, or local file path.
+                Local paths are automatically converted to base64 data URLs
+                since the API does not accept file:// URLs.
+            prompt: Optional text prompt to guide animation.
+            duration: Video duration in seconds (1-15).
+            reference_images: Optional list of image URLs for reference-to-video
+                (R2V) mode. When provided, these become the source images
+                (image_url is ignored by the API). Same URL restrictions as
+                image_url apply — use HTTPS or local paths (auto-converted).
 
         Returns:
             API response with request_id
         """
         url = f"{self.base_url}/videos/generations"
+
+        if reference_images:
+            # R2V mode — reference_images as source
+            payload = {
+                "model": "grok-imagine-video",
+                "prompt": prompt,
+                "reference_images": [{"url": self._resolve_image_url(img)} for img in reference_images],
+                "duration": duration
+            }
+        else:
+            # Standard I2V mode
+            payload = {
+                "model": "grok-imagine-video",
+                "prompt": prompt,
+                "image": {"url": self._resolve_image_url(image_url)},
+                "duration": duration
+            }
+
+        response = requests.post(url, headers=self.headers, json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def extend_video(
+        self,
+        video_url: str,
+        prompt: str,
+        duration: int = 6
+    ) -> Dict[str, Any]:
+        """
+        Extend an existing video by continuing the narrative from its end.
+
+        Uses the /v1/videos/extensions endpoint. The API generates new content
+        that continues directly from where the input video ends — true
+        video-to-video chaining with temporal continuity. Much more reliable
+        than frame-extraction chaining for maintaining visual coherence.
+
+        Args:
+            video_url: Public URL of the video to extend. The input video
+                must be between 2 and 30 seconds long.
+            prompt: Description of what happens next in the video. The prompt
+                should describe the action starting from where the input video ends.
+            duration: Duration of the extension segment in seconds (1-10).
+                Default: 6.
+
+        Returns:
+            API response with request_id
+        """
+        url = f"{self.base_url}/videos/extensions"
         payload = {
             "model": "grok-imagine-video",
             "prompt": prompt,
-            "image": {"url": image_url},
+            "video": {"url": self._resolve_video_url(video_url)},
             "duration": duration
         }
-
         response = requests.post(url, headers=self.headers, json=payload)
         response.raise_for_status()
         return response.json()
@@ -109,7 +227,7 @@ class GrokImagineVideoClient:
         payload = {
             "model": "grok-imagine-video",
             "prompt": edit_prompt,
-            "video_url": video_url
+            "video_url": self._resolve_video_url(video_url)
         }
 
         response = requests.post(url, headers=self.headers, json=payload)
@@ -492,34 +610,57 @@ class GrokImagineVideoClient:
 
         _os.makedirs(output_dir, exist_ok=True)
 
-        # Flatten scenes into frame-chained segments
+        # ── Build segment plan ───────────────────────────────────────────
+        # Each scene is split into 10s segments.
+        # Segment 0 of scene 0: image_to_video() with reference_images
+        # All other segments: extend_video() — feeds previous video directly
+        # This gives true video-to-video continuity vs frame-to-video chaining
         segment_plan = []
         for scene_idx, scene in enumerate(scenes):
             dur = scene.get("duration", 10)
-            n_segs = math.ceil(dur / 10)  # 10s per segment
+            n_segs = math.ceil(dur / 10)
             for seg_i in range(n_segs):
                 segment_plan.append({
                     "scene_idx": scene_idx,
                     "prompt": scene.get("prompt", ""),
-                    "image_url": scene.get("image_url", "") if seg_i == 0 else ""
+                    "image_url": scene.get("image_url", ""),  # original scene image
+                    "is_first_of_scene": seg_i == 0,
+                    "is_first_overall": scene_idx == 0 and seg_i == 0,
                 })
 
         total_segments = len(segment_plan)
-        current_image = scenes[0].get("image_url", "") if scenes else ""
+
         segment_paths = []
+        segment_urls = []  # remote URLs for extend chaining
         start_time = time.time()
 
         for i, plan in enumerate(segment_plan):
             remaining_timeout = max(timeout - (time.time() - start_time), 60)
 
-            # Only pass image_url on the first segment of a new scene
-            seg_image = plan["image_url"] if plan["image_url"] else current_image
-
-            result = self.image_to_video(
-                image_url=seg_image,
-                prompt=plan["prompt"],
-                duration=10
-            )
+            if plan["is_first_overall"]:
+                # Very first segment: image_to_video with scene image as source.
+                result = self.image_to_video(
+                    image_url=plan["image_url"],
+                    prompt=plan["prompt"],
+                    duration=10
+                )
+            elif plan["is_first_of_scene"]:
+                # First segment of a new scene: start from the scene's original
+                # image (different narrative moment — no chaining from prior scene)
+                result = self.image_to_video(
+                    image_url=plan["image_url"],
+                    prompt=plan["prompt"],
+                    duration=10
+                )
+            else:
+                # Continuation of current scene: use extend_video to chain from
+                # the previous segment's video URL for true temporal continuity
+                prev_url = segment_urls[-1]
+                result = self.extend_video(
+                    video_url=prev_url,
+                    prompt=plan["prompt"],
+                    duration=10
+                )
 
             request_id = result["request_id"]
             _scene_progress(plan["scene_idx"], total_segments, f"seg {i+1}/{total_segments}")
@@ -534,20 +675,16 @@ class GrokImagineVideoClient:
             self.download_video(response, seg_path)
             segment_paths.append(seg_path)
 
-            _scene_progress(plan["scene_idx"], total_segments, f"done")
+            # Save remote URL for extend chaining
+            remote_url = response.get("video", {}).get("url", "")
+            if remote_url:
+                segment_urls.append(remote_url)
 
-            frame_path = _os.path.join(output_dir, f"chain_frame_{i:04d}.jpg")
-            self._extract_last_frame(seg_path, frame_path)
-            current_image = f"data:image/jpeg;base64,{self._image_to_base64(frame_path)}"
+            _scene_progress(plan["scene_idx"], total_segments, "done")
 
             if time.time() - start_time >= timeout:
                 raise TimeoutError(f"Timeout at segment {i+1}/{total_segments}")
 
-        output_path = _os.path.join(output_dir, "movie_raw.mp4")
-        self.concatenate_segments(segment_paths, output_path)
-
-        # If finalize_movie not needed, return the raw concatenated path
-        # (users who want transitions/audio should call finalize_movie() instead)
         return segment_paths
 
     # ─── Movie Finalization ───────────────────────────────────────────────
@@ -574,8 +711,10 @@ class GrokImagineVideoClient:
         """
         Join clip_a and clip_b with a cross-dissolve transition at the boundary.
 
-        Trims the end of clip_a by fade_duration and joins it with clip_b
-        using an xfade. The overlap region creates a smooth dissolve.
+        Audio is stripped from both clips — music/audio is applied separately
+        by finalize_movie() after all transitions are applied. This allows a
+        single music track to play across the entire movie without each segment's
+        embedded audio bleeding through.
 
         Args:
             clip_a_path: Path to the first (earlier) video clip.
@@ -629,7 +768,6 @@ class GrokImagineVideoClient:
         segment_paths: list,
         output_path: str,
         transition_duration: float = 1.0,
-        audio_tracks: Optional[list] = None,
         music_track: Optional[str] = "",
         music_crossfade: float = 2.0,
         video_fade_out: float = 2.0,
@@ -638,26 +776,31 @@ class GrokImagineVideoClient:
         """
         Apply cinematic post-processing to a list of video segments.
 
-        Each pair of adjacent segments gets a cross-dissolve transition at
-        their boundary. Audio crossfades are applied simultaneously — the
-        outgoing audio fades out and the incoming audio fades in during the
-        transition window. If no audio tracks are provided, the original
-        segment audio is used with per-segment fades at transitions.
+        Workflow:
+        1. Apply cross-dissolve transitions between all consecutive segments
+           (audio is stripped from intermediate clips — each AI segment carries
+           its own music that would clash across transitions)
+        2. If music_track provided: mix it across the full movie with crossfades
+           at each scene boundary (2s fade out/in)
+        3. Fade to black at the end
+
+        The key design decision: intermediate segment audio is discarded. Each
+        AI-generated clip has its own background music which would otherwise
+        cut abruptly at scene transitions. Provide a single music_track for
+        a cohesive movie soundtrack.
 
         Args:
             segment_paths: Ordered list of video segment file paths.
             output_path: Final output file path.
             transition_duration: Crossfade dissolve duration in seconds between
                 segments. Default: 1.0. Set to 0 to disable transitions.
-            audio_tracks: Optional list of audio file paths, one per segment.
-                Each audio track plays through its segment and crossfades at
-                transitions. If not provided, original segment audio is used.
             music_track: Optional path to a background music file (mp3/m4a/aac).
-                If provided, it plays throughout with cross-fades at transitions.
-            music_crossfade: Duration of music crossfade at each scene
-                boundary. Default: 2.0 seconds.
-            video_fade_out: Duration of fade-to-black at the end of the
-                final segment. Default: 2.0 seconds. Set to 0 to disable.
+                If provided, it plays through the entire movie with 2-second
+                fades at each scene boundary. If not provided, the final
+                movie has no audio (silence).
+            music_crossfade: Duration of music fade at each scene boundary.
+                Default: 2.0 seconds.
+            video_fade_out: Duration of fade-to-black at the end. Default: 2.0.
             output_dir: Working directory for intermediate files.
 
         Returns:
@@ -668,8 +811,7 @@ class GrokImagineVideoClient:
                 segment_paths,           # returned from generate_movie()
                 "/tmp/final_movie.mp4",
                 transition_duration=1.5,
-                audio_tracks=["city_ambient.mp3", "club_music.mp3", "stage_spotlight.mp3"],
-                music_track="epic_score.mp3",
+                music_track="/tmp/epic_score.mp3",
                 music_crossfade=2.0,
                 video_fade_out=2.0,
                 output_dir="/tmp"
@@ -683,12 +825,11 @@ class GrokImagineVideoClient:
         _os.makedirs(output_dir, exist_ok=True)
         seg_dir = output_dir
 
-        # ── 1. Build blending chain ──────────────────────────────────────
-        # Get raw durations
+        # ── 1. Blend segments (video-only, strip segment audio) ──────────
         raw_durs = [self._get_video_duration(p) for p in segment_paths]
 
         if transition_duration > 0 and len(segment_paths) > 1:
-            # Sequentially blend pairs: blend seg[i] + seg[i+1], then result + seg[i+2]
+            # Sequential blending: A+B -> result, then result+C -> ...
             current_video = segment_paths[0]
             current_dur = raw_durs[0]
 
@@ -697,29 +838,32 @@ class GrokImagineVideoClient:
                 clip_b = segment_paths[i + 1]
                 dur_a = current_dur
                 dur_b = raw_durs[i + 1]
-                t_cross = dur_a - transition_duration  # xfade start offset on clip_a timeline
+                t_cross = dur_a - transition_duration
                 out_path = _os.path.join(seg_dir, f"blend_{i:04d}.mp4")
 
-                blend_cmd = self._build_blend_command(
-                    clip_a, clip_b,
-                    dur_a, dur_b,
-                    transition_duration, t_cross,
-                    audio_tracks, i,
-                    out_path, seg_dir
-                )
+                # Blend video with xfade, strip all audio
+                r = subprocess.run([
+                    "ffmpeg", "-y",
+                    "-i", clip_a, "-i", clip_b,
+                    "-filter_complex",
+                    f"[0:v][1:v]xfade=transition=fade:duration={transition_duration}"
+                    f":offset={t_cross}[vt]",
+                    "-map", "[vt]",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-an",  # strip all audio
+                    "-t", str(dur_a + dur_b - transition_duration),
+                    out_path
+                ], capture_output=True, text=True)
 
-                r = subprocess.run(blend_cmd, capture_output=True, text=True)
                 if r.returncode != 0:
                     raise RuntimeError(f"Blend step {i} failed: {r.stderr[-300:]}")
-
                 current_video = out_path
                 current_dur = dur_a + dur_b - transition_duration
 
-            # current_video is now the fully blended movie
             blended_video = current_video
             blended_dur = current_dur
         else:
-            # No transitions — just concatenate
+            # No transitions — concatenate video-only
             blended_video = _os.path.join(seg_dir, "concat_no_transition.mp4")
             concat_list = _os.path.join(seg_dir, "concat.txt")
             with open(concat_list, "w") as f:
@@ -730,108 +874,101 @@ class GrokImagineVideoClient:
                 "-f", "concat", "-safe", "0",
                 "-i", concat_list,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                "-c:a", "aac", "-b:a", "192k",
+                "-an",
                 blended_video
             ], capture_output=True, text=True)
             if r.returncode != 0:
                 raise RuntimeError(f"Concat failed: {r.stderr[-300:]}")
             blended_dur = self._get_video_duration(blended_video)
 
-        # ── 2. Fade to black at end ─────────────────────────────────────
-        final_out = _os.path.join(seg_dir, "movie_with_fade.mp4")
+        # ── 2. Add music with crossfades at scene boundaries ───────────
+        if music_track and _os.path.exists(music_track):
+            music_out = _os.path.join(seg_dir, "movie_with_music.mp4")
+
+            # Build a filtergraph that:
+            # - Loops the music to cover the full movie duration
+            # - Crossfades the music at each scene boundary
+            # - Mixes music over silent video
+
+            # Number of scene boundaries = len(segment_paths) - 1
+            n_transitions = len(segment_paths) - 1
+
+            if n_transitions > 0:
+                # Build afade sections for each transition
+                # Music fades out then in at each boundary
+                # First segment plays with music fading out at transition
+                # Subsequent segments play with music fading back in
+                fade_filter = "[m]"
+
+                t = 0.0
+                for i in range(n_transitions):
+                    seg_dur = raw_durs[i]
+                    fade_out_start = t + seg_dur - music_crossfade
+                    fade_in_start = t + seg_dur
+                    fade_filter += f"afade=t=out:st={fade_out_start:.3f}:d={music_crossfade}"
+                    fade_filter += f";[m]afade=t=in:st={fade_in_start:.3f}:d={music_crossfade}[m]"
+                    t += seg_dur - music_crossfade  # overlap at transition
+
+                # Loop music to match video duration
+                music_filter = (
+                    f"[m]aloop=loop=-1:size=2e9,atrim=0:{blended_dur:.3f},"
+                    f"asetpts=PTS-STARTPTS,{fade_filter},volume=2[mout]"
+                )
+            else:
+                # No transitions — just loop and trim music
+                music_filter = (
+                    f"[m]aloop=loop=-1:size=2e9,atrim=0:{blended_dur:.3f},"
+                    f"asetpts=PTS-STARTPTS,volume=2[mout]"
+                )
+
+            r = subprocess.run([
+                "ffmpeg", "-y",
+                "-i", blended_video,
+                "-stream_loop", "-1", "-i", music_track,
+                "-filter_complex", music_filter,
+                "-map", "[0:v]", "-map", "[mout]",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                music_out
+            ], capture_output=True, text=True)
+
+            if r.returncode != 0:
+                import warnings
+                warnings.warn(f"Music mix failed, using silent video: {r.stderr[:200]}")
+                music_out = blended_video
+        else:
+            music_out = blended_video
+
+        # ── 3. Fade to black at end ─────────────────────────────────────
+        final_out = _os.path.join(seg_dir, "movie_final.mp4")
         if video_fade_out > 0:
             fade_start = max(blended_dur - video_fade_out, 0)
             r = subprocess.run([
                 "ffmpeg", "-y",
-                "-i", blended_video,
-                "-vf", f"fade=t=out:st={fade_start}:d={video_fade_out}",
+                "-i", music_out,
+                "-vf", f"fade=t=out:st={fade_start:.3f}:d={video_fade_out}",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                 "-c:a", "aac", "-b:a", "192k",
                 final_out
             ], capture_output=True, text=True)
         else:
-            final_out = blended_video
+            final_out = music_out
 
-        # Copy to final output
+        # Copy to final output path
         if final_out != output_path:
             import shutil
             shutil.copy2(final_out, output_path)
 
-        # ── 3. Cleanup intermediate files ───────────────────────────────
+        # ── 4. Cleanup ─────────────────────────────────────────────────
         for f in _os.listdir(seg_dir):
-            if f.startswith("blend_") or f.startswith("concat") or f == "movie_with_fade.mp4":
+            if f.startswith(("blend_", "concat", "movie_")):
                 try:
                     _os.remove(_os.path.join(seg_dir, f))
                 except Exception:
                     pass
 
         return output_path
-
-    def _build_audio_blend_filter(
-        self,
-        clip_a_path: str,
-        clip_b_path: str,
-        dur_a: float,
-        dur_b: float,
-        transition_duration: float,
-        t_cross: float,
-        audio_tracks: Optional[list],
-        seg_index: int,
-        seg_dir: str
-    ) -> str:
-        """
-        Build an ffmpeg filtergraph string for crossfading audio between two clips.
-        Returns the audio portion of the filtergraph (without video).
-        """
-        ms_cross = int(t_cross * 1000)
-
-        # Audio from clip A: pad to full blend duration, fade out at transition
-        # Audio from clip B: delay to start at transition point, fade in
-        af = (
-            f"[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-            f"afade=t=out:st={t_cross}:d={transition_duration}[a0];"
-            f"[1:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-            f"adelay={ms_cross}|{ms_cross},afade=t=in:st=0:d={transition_duration}[a1];"
-            f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=2,volume=1.5[aout]"
-        )
-        return af
-
-    def _build_blend_command(
-        self,
-        clip_a_path: str,
-        clip_b_path: str,
-        dur_a: float,
-        dur_b: float,
-        transition_duration: float,
-        t_cross: float,
-        audio_tracks: Optional[list],
-        seg_index: int,
-        out_path: str,
-        seg_dir: str
-    ) -> list:
-        """
-        Build the full ffmpeg command for blending two clips with audio crossfade.
-        """
-        video_filter = (
-            f"[0:v][1:v]xfade=transition=fade:duration={transition_duration}"
-            f":offset={t_cross}[vt]"
-        )
-        audio_filter = self._build_audio_blend_filter(
-            clip_a_path, clip_b_path,
-            dur_a, dur_b,
-            transition_duration, t_cross,
-            audio_tracks, seg_index, seg_dir
-        )
-
-        return [
-            "ffmpeg", "-y",
-            "-i", clip_a_path, "-i", clip_b_path,
-            "-filter_complex", f"{video_filter};{audio_filter}",
-            "-map", "[vt]", "-map", "[aout]",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-c:a", "aac", "-b:a", "192k",
-            out_path
-        ]
 
     def _image_to_base64(self, image_path: str) -> str:
         """Read an image file and return its base64-encoded string."""

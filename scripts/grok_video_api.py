@@ -603,15 +603,15 @@ class GrokImagineVideoClient:
 
         # Concatenate trimmed A + B, then apply xfade at the boundary
         # xfade offset = where to start the crossfade on clip_a's timeline
-        # We want it at the END of trimmed A (trim_a), so the fade spans
-        # the last fade_duration of A into the start of B
+        # dur_a is the original clip duration (before trimming)
+        # so the fade starts at dur_a - fade_duration and lasts fade_duration
         result = subprocess.run([
             "ffmpeg", "-y",
             "-i", tmp_a,
             "-i", clip_b_path,
             "-filter_complex",
             f"[0:v][1:v]xfade=transition=fade:duration={fade_duration}"
-            f":offset={trim_a}[outv]",
+            f":offset={dur_a - fade_duration}[outv]",
             "-map", "[outv]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
             "-t", str(trim_a + fade_duration),

@@ -299,13 +299,39 @@ client.concatenate_segments(segments, "/tmp/long_video.mp4")
 | `FileNotFoundError` | Install ffmpeg (`brew install ffmpeg` on macOS) |
 
 ## Best Practices
+### Prompt Writing
 
-- **Images are instant** — deliver URLs immediately without polling
-- **Videos take 2-3 minutes** — send progress updates to the user while polling
-- **Be descriptive in prompts** — specify style, lighting, camera movement
-- **For videos, include camera direction** — "slow pan", "drone shot over", "close-up of"
+- **Be descriptive** — specify subject, setting, lighting, mood, and camera direction
+- **Include camera motion** — "slow zoom out", "tracking shot left", "drone shot over"
+- **State the starting condition explicitly** — each scene prompt should describe *what the frame looks like* at the start, not just what happens next
+- **Avoid "continuation" language** — write "The hero is now high above the clouds" not "The hero continues flying upward"
+- **Overlap scene transitions** — last 2-3 seconds of scene N's prompt should describe what flows into scene N+1's first seconds
+
+### Long Video / Movie Production
+
+- **Use `generate_movie()` for multi-scene videos** — each scene gets its own prompt while maintaining frame-chain continuity
+- **10s segments, not 15s** — shorter segments keep each clip tight and reduce AI drift from the source frame
+- **Chain length limit: ~60-90s max** — beyond this, accumulated degradation becomes noticeable; reset with the original image every 3-4 scenes if longer
+- **Overlap prompts at scene boundaries** — make the end of one scene's description match the beginning of the next scene's description
+- **Use camera motion to hide seams** — slow pans, zooms, and rotations at scene boundaries make imperfect frame continuity less noticeable than hard cuts
+- **Upload frames to CDN instead of base64** — for production, extract and host chain frames externally to reduce quality loss through the encoding cycle
+- **Each scene prompt describes the frame the viewer sees** — not what just happened, but what they see at the start of the scene
+
+### Frame-Chain Continuity
+
+The AI regenerates each segment from scratch using the chained frame as input. It receives the *content* (colors, costume, setting) but cannot guarantee temporal coherence — a character facing left at the end of scene 1 might face right at the start of scene 2. Frame chaining gives you visual consistency, not true video-to-video continuity.
+
+Techniques to work with this:
+- Describe the chained frame's composition in the next scene's prompt so the AI interprets it correctly
+- Use wide shots or environmental shots rather than tight close-ups at scene boundaries (less sensitive to subtle continuity errors)
+- Add subtle camera motion to mask micro-drift between segments
+
+### General
+
+- **Images generate instantly** — deliver URLs immediately without polling
+- **Videos take 2-3 minutes per segment** — send progress updates while polling
 - **Use 480p for fast iteration** — switch to 720p for final output
-- **Download promptly** — image/video URLs are temporary and expire
+- **Download promptly** — image/video URLs are temporary and expire quickly
 - **Deliver via MEDIA:** — use `MEDIA:/path/to/file` to send files natively in chat
 
 ## File Structure

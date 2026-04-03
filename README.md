@@ -40,7 +40,17 @@ Integrated as a [Hermes agent](https://github.com/DevvGwardo/hermes) skill for s
 
 ## Installation
 
-### As a Hermes Skill
+### Option 1 — One Prompt to Hermes (fastest)
+
+Copy and paste this into Hermes:
+
+```
+Install the Grok Imagine Video skill for me. Clone https://github.com/DevvGwardo/hermes-grok-imagine-video into ~/.hermes/skills/grok-imagine-video, then set my xai_api_key in Hermes config if it's not already set.
+```
+
+Hermes will clone the repo, copy it to the right location, and confirm when it's ready.
+
+### Option 2 — Manual
 
 ```bash
 # 1. Clone the repository
@@ -53,7 +63,17 @@ cp -r hermes-grok-imagine-video ~/.hermes/skills/grok-imagine-video
 hermes config set xai_api_key YOUR_KEY
 ```
 
-That's it. Hermes will automatically load the skill and expose all commands.
+### Option 3 — OpenClaw Evo Agent
+
+```bash
+# SSH into your agent and run:
+cd ~/.hermes/skills && git clone https://github.com/DevvGwardo/hermes-grok-imagine-video.git grok-imagine-video
+
+# Then set the key:
+hermes config set xai_api_key YOUR_KEY
+```
+
+That's it. Hermes loads skills on startup — restart the agent or send any message and the skill becomes available.
 
 ### As a Standalone Python Client
 

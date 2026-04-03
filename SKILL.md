@@ -49,7 +49,7 @@ The skill reads the key from the `XAI_API_KEY` environment variable automaticall
 | Text-to-video | Create videos from text descriptions | ~2-3 min |
 | Image-to-video | Animate a static image into video | ~2-3 min |
 | Video editing | Apply filters, speed, color grading via natural language | ~2-3 min |
-| Long video | Videos longer than 15s via segmentation + ffmpeg | Scales with length |
+| Long video | Videos longer than 15s via frame-chaining + ffmpeg | Scales with length |
 
 ## Workflows
 
@@ -201,7 +201,9 @@ Then poll and download.
 
 ### Long Video (beyond 15s)
 
-For videos longer than 15 seconds, the API requires segmentation. The client handles this automatically:
+For videos longer than 15 seconds, the client generates segments **sequentially** and chains them — after each segment completes, it extracts the last frame and feeds it as input to the next segment. This creates smooth continuous motion instead of jump cuts.
+
+If a starting `image_url` is provided, the first segment animates that image. Each subsequent segment builds from the last frame of the previous one.
 
 ```
 python3 - << 'EOF'
@@ -214,14 +216,27 @@ client = GrokImagineVideoClient(os.getenv("XAI_API_KEY"))
 def progress(idx, total, status):
     print(f"Segment {idx+1}/{total}: {status}")
 
+# Option A: Animate a starting image (chained from last frames)
+segments = client.generate_long_video(
+    prompt="The superhero stands heroically, cape billowing. Camera zooms out revealing a city skyline. Hero takes flight, soaring through clouds.",
+    total_duration=60,
+    segment_duration=10,        # 10s per segment recommended for chaining
+    resolution="720p",
+    output_dir="/tmp",
+    progress_callback=progress,
+    image_url="https://example.com/hero.jpg"   # Optional starting image
+)
+
+# Option B: Text-to-video long video (no image chaining)
 segments = client.generate_long_video(
     prompt="A cinematic journey through ancient ruins at golden hour",
-    total_duration=45,
-    segment_duration=15,
+    total_duration=60,
+    segment_duration=10,
     resolution="720p",
     output_dir="/tmp",
     progress_callback=progress
 )
+
 output = "/tmp/long_video.mp4"
 client.concatenate_segments(segments, output)
 print(output)

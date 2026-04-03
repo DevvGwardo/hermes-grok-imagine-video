@@ -282,6 +282,188 @@ class GrokImagineVideoClient:
 
         return output_path
 
+    # ─── Long Video ────────────────────────────────────────────────────────
+
+    def _extract_last_frame(self, video_path: str, output_path: str) -> str:
+        """
+        Extract the last frame of a video as a JPEG image.
+        Uses ffmpeg. Requires ffmpeg to be installed.
+        """
+        import subprocess
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-sseof", "-1",
+                "-i", video_path,
+                "-frames:v", "1",
+                "-q:v", "2",
+                output_path
+            ],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to extract last frame: {result.stderr}")
+        return output_path
+
+    def generate_long_video(
+        self,
+        prompt: str,
+        total_duration: int,
+        aspect_ratio: str = "16:9",
+        resolution: str = "480p",
+        output_dir: str = "/tmp",
+        segment_duration: int = 15,
+        poll_interval: int = 10,
+        timeout: int = 600,
+        progress_callback: Optional[Any] = None,
+        image_url: str = ""
+    ) -> list:
+        """
+        Generate a video longer than 15 seconds via sequential chaining.
+
+        Each segment is generated one at a time. After a segment completes,
+        its last frame is extracted and used as the input image for the next
+        segment — creating a smooth continuous motion instead of jump cuts.
+
+        Args:
+            prompt: Text description of the video.
+            total_duration: Total desired duration in seconds (unlimited).
+            aspect_ratio: Aspect ratio. Default: 16:9.
+            resolution: "480p" or "720p". Default: 480p.
+            output_dir: Directory to save downloaded segment files.
+            segment_duration: Maximum seconds per API call (1-15). Default: 15.
+            poll_interval: Seconds between status checks. Default: 10.
+            timeout: Maximum seconds to wait for all segments. Default: 600.
+            progress_callback: Optional callable (segment_index, total, status).
+            image_url: Optional starting image URL to animate.
+
+        Returns:
+            Ordered list of local file paths for each segment.
+        """
+        import math
+
+        if not 1 <= segment_duration <= 15:
+            raise ValueError("segment_duration must be between 1 and 15")
+
+        n_segments = math.ceil(total_duration / segment_duration)
+        durations = []
+        remaining = total_duration
+        for _ in range(n_segments):
+            seg = min(segment_duration, remaining)
+            durations.append(seg)
+            remaining -= seg
+
+        import os as _os
+        _os.makedirs(output_dir, exist_ok=True)
+
+        # Start with the provided image; each segment's last frame becomes the next input
+        current_image = image_url
+        segment_paths = []
+        start_time = time.time()
+
+        for i, dur in enumerate(durations):
+            # Extend timeout for sequential mode to account for per-segment wait
+            remaining_timeout = max(timeout - (time.time() - start_time), 60)
+
+            if i == 0 and image_url:
+                # First segment: use the provided image
+                result = self.image_to_video(
+                    image_url=image_url,
+                    prompt=prompt,
+                    duration=dur
+                )
+            elif current_image:
+                # Subsequent segments: use the last frame of the previous segment
+                result = self.image_to_video(
+                    image_url=current_image,
+                    prompt=prompt,
+                    duration=dur
+                )
+            else:
+                # Fallback to text-to-video if no chain image available
+                result = self.text_to_video(
+                    prompt=prompt,
+                    duration=dur,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution
+                )
+
+            request_id = result["request_id"]
+            if progress_callback:
+                progress_callback(i, n_segments, f"submitted (chaining)")
+
+            # Poll this segment to completion
+            response = self.wait_for_completion(
+                request_id,
+                poll_interval=poll_interval,
+                timeout=remaining_timeout
+            )
+
+            # Download the completed segment
+            seg_path = _os.path.join(output_dir, f"segment_{i:04d}.mp4")
+            self.download_video(response, seg_path)
+            segment_paths.append(seg_path)
+
+            if progress_callback:
+                progress_callback(i, n_segments, "done")
+
+            # Extract the last frame for the next segment
+            frame_path = _os.path.join(output_dir, f"chain_frame_{i:04d}.jpg")
+            self._extract_last_frame(seg_path, frame_path)
+            current_image = f"data:image/jpeg;base64,{self._image_to_base64(frame_path)}"
+
+            if time.time() - start_time >= timeout:
+                raise TimeoutError(f"Timeout reached at segment {i+1}/{n_segments}")
+
+        return segment_paths
+
+    def _image_to_base64(self, image_path: str) -> str:
+        """Read an image file and return its base64-encoded string."""
+        import base64
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
+    def concatenate_segments(self, segment_paths: list, output_path: str) -> str:
+        """
+        Concatenate video segments into a single file using ffmpeg.
+
+        Requires ffmpeg to be installed and accessible in PATH.
+
+        Args:
+            segment_paths: Ordered list of local segment file paths.
+            output_path: Local path for the final concatenated video.
+
+        Returns:
+            The output_path that was written.
+        """
+        import subprocess, tempfile as _tempfile, os as _os
+
+        for path in segment_paths:
+            if not _os.path.exists(path):
+                raise FileNotFoundError(f"Segment not found: {path}")
+
+        out_dir = _os.path.dirname(_os.path.abspath(output_path))
+        if out_dir:
+            _os.makedirs(out_dir, exist_ok=True)
+
+        with _tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            concat_list = f.name
+            for path in segment_paths:
+                f.write(f"file '{_os.path.abspath(path)}'\n")
+
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", concat_list, "-c", "copy", output_path],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg failed:\n{result.stderr}")
+        finally:
+            _os.unlink(concat_list)
+
+        return output_path
+
 
 def main():
     """Example usage."""

@@ -316,17 +316,23 @@ class GrokImagineVideoClient:
         poll_interval: int = 10,
         timeout: int = 600,
         progress_callback: Optional[Any] = None,
-        image_url: str = ""
+        image_url: str = "",
+        scenes: Optional[list] = None
     ) -> list:
         """
-        Generate a video longer than 15 seconds via sequential chaining.
+        Generate a video longer than 15 seconds via sequential frame-chaining.
 
         Each segment is generated one at a time. After a segment completes,
         its last frame is extracted and used as the input image for the next
-        segment — creating a smooth continuous motion instead of jump cuts.
+        segment — creating smooth continuous motion instead of jump cuts.
+
+        **Multi-scene mode:** Pass a list of scene dicts via the `scenes`
+        parameter. Each scene has its own prompt (and optional image_url).
+        This lets you craft a narrative movie where each scene has distinct
+        action while maintaining visual continuity through frame-chaining.
 
         Args:
-            prompt: Text description of the video.
+            prompt: Default prompt used for all segments if `scenes` is not set.
             total_duration: Total desired duration in seconds (unlimited).
             aspect_ratio: Aspect ratio. Default: 16:9.
             resolution: "480p" or "720p". Default: 480p.
@@ -335,7 +341,10 @@ class GrokImagineVideoClient:
             poll_interval: Seconds between status checks. Default: 10.
             timeout: Maximum seconds to wait for all segments. Default: 600.
             progress_callback: Optional callable (segment_index, total, status).
-            image_url: Optional starting image URL to animate.
+            image_url: Optional starting image URL for the first segment.
+            scenes: Optional list of scene dicts for multi-prompt movie mode.
+                Each dict: {"prompt": "...", "duration": 10, "image_url": "..."}
+                The last frame of each scene chains into the next automatically.
 
         Returns:
             Ordered list of local file paths for each segment.
@@ -353,36 +362,49 @@ class GrokImagineVideoClient:
             durations.append(seg)
             remaining -= seg
 
+        # ── Build per-segment prompt/image plan ───────────────────────────
+        if scenes:
+            # Flatten scenes into per-segment instructions
+            segment_plan = []
+            for scene in scenes:
+                scene_dur = scene.get("duration", segment_duration)
+                scene_n = math.ceil(scene_dur / segment_duration)
+                for _ in range(scene_n):
+                    segment_plan.append({
+                        "prompt": scene.get("prompt", prompt),
+                        "image_url": scene.get("image_url", ""),
+                    })
+        else:
+            # Single-prompt chaining mode
+            segment_plan = [
+                {"prompt": prompt, "image_url": image_url if i == 0 else ""}
+                for i in range(n_segments)
+            ]
+
         import os as _os
         _os.makedirs(output_dir, exist_ok=True)
 
-        # Start with the provided image; each segment's last frame becomes the next input
         current_image = image_url
         segment_paths = []
         start_time = time.time()
+        total_segments = len(segment_plan)
 
-        for i, dur in enumerate(durations):
-            # Extend timeout for sequential mode to account for per-segment wait
+        for i, plan in enumerate(segment_plan):
+            dur = min(durations[i] if i < len(durations) else segment_duration, segment_duration)
             remaining_timeout = max(timeout - (time.time() - start_time), 60)
 
-            if i == 0 and image_url:
-                # First segment: use the provided image
+            seg_prompt = plan["prompt"]
+            seg_image = plan["image_url"] if plan.get("image_url") else current_image
+
+            if seg_image:
                 result = self.image_to_video(
-                    image_url=image_url,
-                    prompt=prompt,
-                    duration=dur
-                )
-            elif current_image:
-                # Subsequent segments: use the last frame of the previous segment
-                result = self.image_to_video(
-                    image_url=current_image,
-                    prompt=prompt,
+                    image_url=seg_image,
+                    prompt=seg_prompt,
                     duration=dur
                 )
             else:
-                # Fallback to text-to-video if no chain image available
                 result = self.text_to_video(
-                    prompt=prompt,
+                    prompt=seg_prompt,
                     duration=dur,
                     aspect_ratio=aspect_ratio,
                     resolution=resolution
@@ -390,32 +412,140 @@ class GrokImagineVideoClient:
 
             request_id = result["request_id"]
             if progress_callback:
-                progress_callback(i, n_segments, f"submitted (chaining)")
+                progress_callback(i, total_segments, f"chaining")
 
-            # Poll this segment to completion
             response = self.wait_for_completion(
                 request_id,
                 poll_interval=poll_interval,
                 timeout=remaining_timeout
             )
 
-            # Download the completed segment
             seg_path = _os.path.join(output_dir, f"segment_{i:04d}.mp4")
             self.download_video(response, seg_path)
             segment_paths.append(seg_path)
 
             if progress_callback:
-                progress_callback(i, n_segments, "done")
+                progress_callback(i, total_segments, "done")
 
-            # Extract the last frame for the next segment
             frame_path = _os.path.join(output_dir, f"chain_frame_{i:04d}.jpg")
             self._extract_last_frame(seg_path, frame_path)
             current_image = f"data:image/jpeg;base64,{self._image_to_base64(frame_path)}"
 
             if time.time() - start_time >= timeout:
-                raise TimeoutError(f"Timeout reached at segment {i+1}/{n_segments}")
+                raise TimeoutError(f"Timeout reached at segment {i+1}/{total_segments}")
 
         return segment_paths
+
+    def generate_movie(
+        self,
+        scenes: list,
+        output_dir: str = "/tmp",
+        resolution: str = "720p",
+        poll_interval: int = 10,
+        timeout: int = 1800,
+        progress_callback: Optional[Any] = None
+    ) -> str:
+        """
+        Generate a narrative movie from a list of scenes, each with its own prompt.
+        Segments are frame-chained between scenes for smooth visual continuity.
+
+        Each scene's last frame automatically becomes the first frame of the next
+        scene's video, creating seamless motion across scene transitions.
+
+        Args:
+            scenes: List of scene dicts. Each dict:
+                {
+                    "prompt": "Description of what happens in this scene",
+                    "duration": 10,          # How long this scene lasts (seconds)
+                    "image_url": "..."      # Optional starting image for scene 1
+                }
+                Duration is split into 10s segments internally. Each segment
+                chains from the last frame of the previous segment.
+            output_dir: Directory for temp files. Default: /tmp.
+            resolution: "480p" or "720p". Default: 720p.
+            poll_interval: Seconds between status polls. Default: 10.
+            timeout: Max seconds total. Default: 1800 (30 min).
+            progress_callback: Optional callable (scene_index, total, status).
+
+        Returns:
+            Path to the final concatenated movie file.
+
+        Example:
+            client.generate_movie([
+                {"prompt": "A superhero stands tall in a dark city, cape billowing",
+                 "duration": 15, "image_url": "https://example.com/hero.jpg"},
+                {"prompt": "The hero launches into the sky, lightning crackling around them",
+                 "duration": 15},
+                {"prompt": "Flying over a stormy ocean as the sun sets dramatically",
+                 "duration": 15},
+                {"prompt": "Landing gracefully on a rooftop as the city lights flicker on",
+                 "duration": 15},
+            ])
+        """
+        import os as _os, math
+
+        total_duration = sum(s.get("duration", 10) for s in scenes)
+
+        def _scene_progress(scene_idx, total, status):
+            if progress_callback:
+                progress_callback(scene_idx, total, status)
+
+        _os.makedirs(output_dir, exist_ok=True)
+
+        # Flatten scenes into frame-chained segments
+        segment_plan = []
+        for scene_idx, scene in enumerate(scenes):
+            dur = scene.get("duration", 10)
+            n_segs = math.ceil(dur / 10)  # 10s per segment
+            for seg_i in range(n_segs):
+                segment_plan.append({
+                    "scene_idx": scene_idx,
+                    "prompt": scene.get("prompt", ""),
+                    "image_url": scene.get("image_url", "") if seg_i == 0 else ""
+                })
+
+        total_segments = len(segment_plan)
+        current_image = scenes[0].get("image_url", "") if scenes else ""
+        segment_paths = []
+        start_time = time.time()
+
+        for i, plan in enumerate(segment_plan):
+            remaining_timeout = max(timeout - (time.time() - start_time), 60)
+
+            # Only pass image_url on the first segment of a new scene
+            seg_image = plan["image_url"] if plan["image_url"] else current_image
+
+            result = self.image_to_video(
+                image_url=seg_image,
+                prompt=plan["prompt"],
+                duration=10
+            )
+
+            request_id = result["request_id"]
+            _scene_progress(plan["scene_idx"], total_segments, f"seg {i+1}/{total_segments}")
+
+            response = self.wait_for_completion(
+                request_id,
+                poll_interval=poll_interval,
+                timeout=remaining_timeout
+            )
+
+            seg_path = _os.path.join(output_dir, f"segment_{i:04d}.mp4")
+            self.download_video(response, seg_path)
+            segment_paths.append(seg_path)
+
+            _scene_progress(plan["scene_idx"], total_segments, f"done")
+
+            frame_path = _os.path.join(output_dir, f"chain_frame_{i:04d}.jpg")
+            self._extract_last_frame(seg_path, frame_path)
+            current_image = f"data:image/jpeg;base64,{self._image_to_base64(frame_path)}"
+
+            if time.time() - start_time >= timeout:
+                raise TimeoutError(f"Timeout at segment {i+1}/{total_segments}")
+
+        output_path = _os.path.join(output_dir, "movie.mp4")
+        self.concatenate_segments(segment_paths, output_path)
+        return output_path
 
     def _image_to_base64(self, image_path: str) -> str:
         """Read an image file and return its base64-encoded string."""

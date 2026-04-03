@@ -49,7 +49,7 @@ The skill reads the key from the `XAI_API_KEY` environment variable automaticall
 | Text-to-video | Create videos from text descriptions | ~2-3 min |
 | Image-to-video | Animate a static image into video | ~2-3 min |
 | Video editing | Apply filters, speed, color grading via natural language | ~2-3 min |
-| Long video | Videos longer than 15s via frame-chaining + ffmpeg | Scales with length |
+| Long video | Frame-chained segments via generate_movie() | Scales with length |
 
 ## Workflows
 
@@ -199,11 +199,9 @@ EOF
 
 Then poll and download.
 
-### Long Video (beyond 15s)
+### Long Video — generate_movie() (recommended)
 
-For videos longer than 15 seconds, the client generates segments **sequentially** and chains them — after each segment completes, it extracts the last frame and feeds it as input to the next segment. This creates smooth continuous motion instead of jump cuts.
-
-If a starting `image_url` is provided, the first segment animates that image. Each subsequent segment builds from the last frame of the previous one.
+For videos longer than 15 seconds, use `generate_movie()`. It takes a list of **scenes**, each with its own prompt. The last frame of each scene chains into the next automatically — giving you a narrative movie with smooth visual continuity.
 
 ```
 python3 - << 'EOF'
@@ -213,37 +211,54 @@ from grok_video_api import GrokImagineVideoClient
 
 client = GrokImagineVideoClient(os.getenv("XAI_API_KEY"))
 
-def progress(idx, total, status):
-    print(f"Segment {idx+1}/{total}: {status}")
+def progress(scene_idx, total, status):
+    print(f"[Scene {scene_idx+1}] {status}")
 
-# Option A: Animate a starting image (chained from last frames)
-segments = client.generate_long_video(
-    prompt="The superhero stands heroically, cape billowing. Camera zooms out revealing a city skyline. Hero takes flight, soaring through clouds.",
-    total_duration=60,
-    segment_duration=10,        # 10s per segment recommended for chaining
-    resolution="720p",
-    output_dir="/tmp",
-    progress_callback=progress,
-    image_url="https://example.com/hero.jpg"   # Optional starting image
-)
-
-# Option B: Text-to-video long video (no image chaining)
-segments = client.generate_long_video(
-    prompt="A cinematic journey through ancient ruins at golden hour",
-    total_duration=60,
-    segment_duration=10,
+movie = client.generate_movie(
+    scenes=[
+        {
+            "prompt": "A superhero stands tall in a dark city, cape billowing dramatically in the wind. Dramatic lighting, epic scale.",
+            "duration": 15,
+            "image_url": "https://example.com/hero.jpg"
+        },
+        {
+            "prompt": "The hero launches into the sky, lightning crackling around them. Clouds rush past as the city shrinks below.",
+            "duration": 15
+        },
+        {
+            "prompt": "Flying over a stormy ocean at sunset, golden light reflecting off massive waves. Epic aerial cinematography.",
+            "duration": 15
+        },
+        {
+            "prompt": "Descending toward a mountain peak, landing gracefully as the last light of day fades into a starry night.",
+            "duration": 15
+        },
+    ],
     resolution="720p",
     output_dir="/tmp",
     progress_callback=progress
 )
-
-output = "/tmp/long_video.mp4"
-client.concatenate_segments(segments, output)
-print(output)
+print(movie)
 EOF
 ```
 
-Send the final file with `MEDIA:/tmp/long_video.mp4`.
+Send the final file with `MEDIA:/tmp/movie.mp4`.
+
+### Long Video — generate_long_video() (single prompt)
+
+If you just want one continuous shot with the same motion throughout, use `generate_long_video()` with a single prompt. Frame-chaining is still applied automatically:
+
+```
+segments = client.generate_long_video(
+    prompt="A slow zoom out from a superhero standing in a city, cape billowing in the wind",
+    total_duration=60,
+    segment_duration=10,       # 10s recommended for smooth chaining
+    resolution="720p",
+    output_dir="/tmp",
+    image_url="https://example.com/hero.jpg"
+)
+client.concatenate_segments(segments, "/tmp/long_video.mp4")
+```
 
 ## Parameters Reference
 

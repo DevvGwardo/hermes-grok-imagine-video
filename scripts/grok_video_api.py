@@ -8,7 +8,7 @@ import requests
 import time
 import json
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 class GrokImagineVideoClient:
@@ -227,7 +227,7 @@ class GrokImagineVideoClient:
         payload = {
             "model": "grok-imagine-video",
             "prompt": edit_prompt,
-            "video_url": self._resolve_video_url(video_url)
+            "video": {"url": self._resolve_video_url(video_url)}
         }
 
         response = requests.post(url, headers=self.headers, json=payload)
@@ -365,6 +365,12 @@ class GrokImagineVideoClient:
             if progress_callback:
                 progress_callback(response)
 
+            # Check if job failed
+            status = response.get("status", "")
+            if status == "failed":
+                error = response.get("error", "unknown")
+                raise RuntimeError(f"Job {request_id} failed: {error}")
+
             # Check if video is done (response has video object)
             if "video" in response and response.get("video", {}).get("url"):
                 return response
@@ -401,6 +407,19 @@ class GrokImagineVideoClient:
         return output_path
 
     # ─── Long Video ────────────────────────────────────────────────────────
+
+    def _require_ffmpeg(self):
+        """Raise a clear error if ffmpeg is not installed."""
+        import subprocess
+        try:
+            subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        except (subprocess.NotFoundError, FileNotFoundError):
+            raise RuntimeError(
+                "ffmpeg is required but not installed. "
+                "Install it with: brew install ffmpeg (macOS) or apt install ffmpeg (Linux)"
+            )
+        except subprocess.TimeoutExpired:
+            pass  # version check timed out, ffmpeg likely exists
 
     def _extract_last_frame(self, video_path: str, output_path: str) -> str:
         """
@@ -467,6 +486,7 @@ class GrokImagineVideoClient:
         Returns:
             Ordered list of local file paths for each segment.
         """
+        self._require_ffmpeg()
         import math
 
         if not 1 <= segment_duration <= 15:
@@ -600,6 +620,7 @@ class GrokImagineVideoClient:
                  "duration": 15},
             ])
         """
+        self._require_ffmpeg()
         import os as _os, math
 
         total_duration = sum(s.get("duration", 10) for s in scenes)
@@ -817,6 +838,7 @@ class GrokImagineVideoClient:
                 output_dir="/tmp"
             )
         """
+        self._require_ffmpeg()
         import subprocess, os as _os, math
 
         if len(segment_paths) == 0:
@@ -989,6 +1011,7 @@ class GrokImagineVideoClient:
         Returns:
             The output_path that was written.
         """
+        self._require_ffmpeg()
         import subprocess, tempfile as _tempfile, os as _os
 
         for path in segment_paths:
